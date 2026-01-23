@@ -14,14 +14,13 @@ if str(ROOT) not in sys.path:
 
 
 from energy import energy_measurement_supported, read_energy_joules
-
-# UWAGA: to musi się zgadzać z FMA_PEAK_N w microbench.c
-FMA_PEAK_N = 256
+from cpu_utils import make_cpu_specific_csv_path
 
 
 def load_library():
-    root = Path(__file__).resolve().parents[2]  # -> apple_microbench/
+    """Ładuje libmicrobench.* z cpu/lib – cross-platform."""
     system = platform.system()
+    root = ROOT
 
     if system == "Darwin":
         lib_name = "libmicrobench.dylib"
@@ -42,20 +41,26 @@ def load_library():
 def configure_functions(lib):
     func = lib.fma_peak_mt
     func.argtypes = [
-        ct.c_size_t,  # iters
-        ct.c_int,     # num_threads
+        ct.c_size_t,
+        ct.c_size_t,
+        ct.c_int,
     ]
     func.restype = None
     return func
 
 
 def detect_cpu_model() -> str:
+    """
+    Próbuje wykryć pełny model CPU (Apple M2 Pro, Intel(R) Core..., itd.).
+    """
     system = platform.system()
+
     try:
         if system == "Darwin":
             out = subprocess.check_output(
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
-                text=True,
+                encoding="utf-8",
+                stderr=subprocess.DEVNULL,
             ).strip()
             if out:
                 return out
@@ -75,36 +80,17 @@ def detect_cpu_model() -> str:
     return platform.processor() or platform.machine()
 
 
-def collect_system_metadata():
-    return {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "system": platform.system(),
-        "node": platform.node(),
-        "release": platform.release(),
-        "version": platform.version(),
-        "machine": platform.machine(),
-        "processor": platform.processor(),
-        "cpu_model": detect_cpu_model(),
-        "python_version": platform.python_version(),
-    }
+FMA_PEAK_N = 256
 
 
-def bench_fma_peak(fma_peak_mt, iters_inner: int, num_threads: int):
-    """
-    Peak FMA:
-      - każdy wątek pracuje na swoim małym wektorze (FMA_PEAK_N),
-      - liczymy GFLOP/s = 2 * N * iters_inner * num_threads / czas.
-    """
-    # rozgrzewka
-    fma_peak_mt(min(iters_inner, 10_000), num_threads)
-
+def bench_fma_peak(fma_peak_mt, n_per_thread: int, iters_inner: int, num_threads: int):
     energy_j = None
     e_before = None
     if energy_measurement_supported():
         e_before = read_energy_joules()
 
     t0 = time.perf_counter()
-    fma_peak_mt(iters_inner, num_threads)
+    fma_peak_mt(n_per_thread, iters_inner, num_threads)
     t1 = time.perf_counter()
 
     if e_before is not None:
@@ -115,26 +101,52 @@ def bench_fma_peak(fma_peak_mt, iters_inner: int, num_threads: int):
                 energy_j = delta
 
     elapsed = t1 - t0
-    flops = 2.0 * FMA_PEAK_N * iters_inner * num_threads
-    gflops = flops / elapsed / 1e9
-    avg_power_w = energy_j / elapsed if (energy_j is not None and elapsed > 0) else None
+    total_ops = 2 * n_per_thread * iters_inner * num_threads
+    gflops = total_ops / elapsed / 1e9
+
+    avg_power_w = None
+    if energy_j is not None and elapsed > 0:
+        avg_power_w = energy_j / elapsed
 
     return {
         "iters_inner": iters_inner,
+        "threads": num_threads,
         "num_threads": num_threads,
+        "n_per_thread": n_per_thread,
         "elapsed_s": elapsed,
         "gflops": gflops,
         "energy_j": energy_j,
+        "power_w": avg_power_w,
         "avg_power_w": avg_power_w,
     }
 
 
-def write_result_to_csv(csv_path: Path, result: dict, meta: dict, write_header: bool):
+def collect_system_metadata():
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "system": platform.system(),
+        "node": platform.node(),
+        "release": platform.release(),
+        "version": platform.version(),
+        "machine": platform.machine(),
+        "arch": platform.machine(),
+        "processor": platform.processor(),
+        "cpu_model": detect_cpu_model(),
+        "python_version": platform.python_version(),
+    }
+
+
+def write_result_to_csv(
+    csv_path: Path,
+    result: dict,
+    meta: dict,
+    benchmark_name: str,
+    write_header: bool,
+):
     row = {
         **meta,
-        "benchmark": "fma_compute_peak",
-        "n_per_thread": FMA_PEAK_N,
-        **result,  # run_id, energy_j, avg_power_w
+        "benchmark": benchmark_name,
+        **result,
     }
 
     fieldnames = [
@@ -144,17 +156,20 @@ def write_result_to_csv(csv_path: Path, result: dict, meta: dict, write_header: 
         "release",
         "version",
         "machine",
+        "arch",
         "processor",
         "cpu_model",
         "python_version",
         "benchmark",
         "run_id",
-        "n_per_thread",
         "iters_inner",
+        "threads",
         "num_threads",
+        "n_per_thread",
         "elapsed_s",
         "gflops",
         "energy_j",
+        "power_w",
         "avg_power_w",
     ]
 
@@ -168,13 +183,20 @@ def write_result_to_csv(csv_path: Path, result: dict, meta: dict, write_header: 
 def main():
     lib, root = load_library()
     fma_peak_mt = configure_functions(lib)
-    meta = collect_system_metadata()
 
     data_dir = root / "data" / "cpu"
     data_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = data_dir / "compute_fma_peak_results.csv"
+
+    csv_path, arch, cpu_model, cpu_slug = make_cpu_specific_csv_path(
+        "compute_fma_peak",
+        data_dir,
+    )
     if csv_path.exists():
         csv_path.unlink()  # nadpisujemy stare wyniki
+
+    meta = collect_system_metadata()
+    meta["arch"] = arch
+    meta["cpu_model"] = cpu_model
 
     threads_list = [1, 2, 4, 8]
     iters_list = [500_000, 1_000_000, 2_000_000]
@@ -192,15 +214,15 @@ def main():
     header_written = False
 
     for num_threads in threads_list:
-        print(f"\n### num_threads = {num_threads} ###")
         for iters_inner in iters_list:
+            print(f"\n### num_threads = {num_threads} ###")
+            print(f"\n--- iters_inner = {iters_inner} ---")
+
             gflops_values = []
             energy_values = []
 
-            print(f"\n--- iters_inner = {iters_inner} ---")
-
             for run_id in range(runs):
-                result = bench_fma_peak(fma_peak_mt, iters_inner, num_threads)
+                result = bench_fma_peak(fma_peak_mt, FMA_PEAK_N, iters_inner, num_threads)
                 gflops_values.append(result["gflops"])
                 if result["energy_j"] is not None:
                     energy_values.append(result["energy_j"])
@@ -209,37 +231,32 @@ def main():
                     csv_path,
                     {**result, "run_id": run_id},
                     meta,
+                    "fma_peak_mt",
                     write_header=not header_written,
                 )
                 header_written = True
 
-                line = (
-                    f"run {run_id:2d}: "
-                    f"elapsed = {result['elapsed_s']:.4f} s, "
-                    f"GFlop/s = {result['gflops']:.2f}"
+                print(
+                    f"run  {run_id:2d}: elapsed = {result['elapsed_s']:.4f} s, "
+                    f"GFlop/s = {result['gflops']:.2f}, "
+                    f"energy = {result['energy_j'] if result['energy_j'] is not None else float('nan'):.4f} J"
                 )
-                if result["avg_power_w"] is not None:
-                    line += f", P_avg = {result['avg_power_w']:.2f} W"
-                print(line)
 
             mean_gflops = sum(gflops_values) / len(gflops_values)
             if len(gflops_values) > 1:
-                import math
-                var = sum((x - mean_gflops) ** 2 for x in gflops_values) / len(gflops_values)
-                stdev_gflops = math.sqrt(var)
+                import statistics as stats
+
+                stdev_gflops = stats.pstdev(gflops_values)
             else:
                 stdev_gflops = 0.0
 
             print(f"==> ŚREDNIA: {mean_gflops:.2f} GF/s, σ = {stdev_gflops:.2f} GF/s")
 
             if energy_values:
+                import statistics as stats
+
                 mean_energy = sum(energy_values) / len(energy_values)
-                if len(energy_values) > 1:
-                    import math
-                    var_e = sum((x - mean_energy) ** 2 for x in energy_values) / len(energy_values)
-                    stdev_energy = math.sqrt(var_e)
-                else:
-                    stdev_energy = 0.0
+                stdev_energy = stats.pstdev(energy_values) if len(energy_values) > 1 else 0.0
                 print(f"    ŚREDNIA energia per run: {mean_energy:.4f} J, σ = {stdev_energy:.4f} J")
 
     print(f"\nWszystkie runy zapisane do: {csv_path}")

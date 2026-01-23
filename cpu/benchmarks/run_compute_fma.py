@@ -16,11 +16,13 @@ if str(ROOT) not in sys.path:
 
 
 from energy import energy_measurement_supported, read_energy_joules
+from cpu_utils import make_cpu_specific_csv_path
 
 
 def load_library():
-    root = Path(__file__).resolve().parents[2]  # -> apple_microbench/
+    """Ładuje libmicrobench.* z cpu/lib – cross-platform."""
     system = platform.system()
+    root = ROOT
 
     if system == "Darwin":
         lib_name = "libmicrobench.dylib"
@@ -39,6 +41,7 @@ def load_library():
 
 
 def configure_functions(lib):
+    # nazwa musi zgadzać się z microbench.c / microbench.h
     func = lib.fma_kernel
     func.argtypes = [
         ct.POINTER(ct.c_float),  # a
@@ -52,12 +55,17 @@ def configure_functions(lib):
 
 
 def detect_cpu_model() -> str:
+    """
+    Próbuje wykryć pełny model CPU (Apple M2 Pro, Intel(R) Core..., itd.).
+    """
     system = platform.system()
+
     try:
         if system == "Darwin":
             out = subprocess.check_output(
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
-                text=True,
+                encoding="utf-8",
+                stderr=subprocess.DEVNULL,
             ).strip()
             if out:
                 return out
@@ -78,10 +86,7 @@ def detect_cpu_model() -> str:
 
 
 def bench_fma(fma_kernel, n: int, iters_inner: int):
-    """
-    FMA benchmark:
-      a[i] = a[i] * b[i] + c[i], powtórzone iters_inner razy.
-    """
+    np.random.seed(0)
     a = np.random.rand(n).astype(np.float32)
     b = np.random.rand(n).astype(np.float32)
     c = np.random.rand(n).astype(np.float32)
@@ -90,8 +95,7 @@ def bench_fma(fma_kernel, n: int, iters_inner: int):
     b_p = b.ctypes.data_as(ct.POINTER(ct.c_float))
     c_p = c.ctypes.data_as(ct.POINTER(ct.c_float))
 
-    # rozgrzewka
-    fma_kernel(a_p, b_p, c_p, n, min(iters_inner, 1000))
+    fma_kernel(a_p, b_p, c_p, n, 1)
 
     energy_j = None
     e_before = None
@@ -110,16 +114,21 @@ def bench_fma(fma_kernel, n: int, iters_inner: int):
                 energy_j = delta
 
     elapsed = t1 - t0
-    flops = 2.0 * n * iters_inner
-    gflops = flops / elapsed / 1e9
-    avg_power_w = energy_j / elapsed if (energy_j is not None and elapsed > 0) else None
+    total_ops = 2 * n * iters_inner
+    gflops = total_ops / elapsed / 1e9
+
+    avg_power_w = None
+    if energy_j is not None and elapsed > 0:
+        avg_power_w = energy_j / elapsed
 
     return {
+        "n": n,
         "vector_len": n,
         "iters_inner": iters_inner,
         "elapsed_s": elapsed,
         "gflops": gflops,
         "energy_j": energy_j,
+        "power_w": avg_power_w,
         "avg_power_w": avg_power_w,
     }
 
@@ -132,17 +141,24 @@ def collect_system_metadata():
         "release": platform.release(),
         "version": platform.version(),
         "machine": platform.machine(),
+        "arch": platform.machine(),
         "processor": platform.processor(),
         "cpu_model": detect_cpu_model(),
         "python_version": platform.python_version(),
     }
 
 
-def write_result_to_csv(csv_path: Path, result: dict, meta: dict, write_header: bool):
+def write_result_to_csv(
+    csv_path: Path,
+    result: dict,
+    meta: dict,
+    benchmark_name: str,
+    write_header: bool,
+):
     row = {
         **meta,
-        "benchmark": "fma_compute",
-        **result,  # run_id, energy_j, avg_power_w
+        "benchmark": benchmark_name,
+        **result,
     }
 
     fieldnames = [
@@ -152,16 +168,19 @@ def write_result_to_csv(csv_path: Path, result: dict, meta: dict, write_header: 
         "release",
         "version",
         "machine",
+        "arch",
         "processor",
         "cpu_model",
         "python_version",
         "benchmark",
         "run_id",
+        "n",
         "vector_len",
         "iters_inner",
         "elapsed_s",
         "gflops",
         "energy_j",
+        "power_w",
         "avg_power_w",
     ]
 
@@ -175,15 +194,22 @@ def write_result_to_csv(csv_path: Path, result: dict, meta: dict, write_header: 
 def main():
     lib, root = load_library()
     fma_kernel = configure_functions(lib)
-    meta = collect_system_metadata()
 
     data_dir = root / "data" / "cpu"
     data_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = data_dir / "compute_fma_results.csv"
+
+    csv_path, arch, cpu_model, cpu_slug = make_cpu_specific_csv_path(
+        "compute_fma",
+        data_dir,
+    )
     if csv_path.exists():
         csv_path.unlink()  # nadpisujemy stare wyniki
 
-    vector_len = 4096        # ~16 KB, L1-friendly
+    meta = collect_system_metadata()
+    meta["arch"] = arch
+    meta["cpu_model"] = cpu_model
+
+    vector_len = 4096
     iters_list = [250_000, 500_000, 1_000_000]
     runs = 5
 
@@ -214,18 +240,16 @@ def main():
                 csv_path,
                 {**result, "run_id": run_id},
                 meta,
+                "fma_single",
                 write_header=not header_written,
             )
             header_written = True
 
-            line = (
-                f"run {run_id:2d}: "
-                f"elapsed = {result['elapsed_s']:.4f} s, "
-                f"GFlop/s = {result['gflops']:.2f}"
+            print(
+                f"run {run_id:2d}: elapsed = {result['elapsed_s']:.4f} s, "
+                f"GFlop/s = {result['gflops']:.2f}, "
+                f"energy = {result['energy_j'] if result['energy_j'] is not None else float('nan'):.4f} J"
             )
-            if result["avg_power_w"] is not None:
-                line += f", P_avg = {result['avg_power_w']:.2f} W"
-            print(line)
 
         mean_gflops = stats.mean(gflops_values)
         stdev_gflops = stats.pstdev(gflops_values) if len(gflops_values) > 1 else 0.0
