@@ -1,102 +1,138 @@
-# gpu/benchmarks/run_gpu_bandwidth.py
+from __future__ import annotations
+
 import argparse
 import csv
-import platform
-from datetime import datetime
-from pathlib import Path
 import statistics as stats
+from datetime import datetime, timezone
+from pathlib import Path
 import sys
 
+# ROOT projektu: .../apple_microbench
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gpu.gpu_utils import (
-    load_cuda_library,
-    configure_cuda_functions,
-    select_cuda_device,
-    make_gpu_specific_csv_path,
-)
+import gpu_utils  # z apple_microbench/gpu_utils.py
 
 
-def collect_metadata(gpu_backend: str, gpu_name: str, device_id: int):
+def run_gpu_bandwidth(
+    preferred_device: int | None,
+    runs_per_size: int,
+    sizes_mb: list[int],
+    iters_kernel: int,
+) -> None:
     """
-    Metadane hosta + GPU (model karty, backend, device_id).
+    Benchmark przepustowości pamięci na CUDA:
+      - kernel mem_copy_kernel (device->device copy),
+      - bytes_total = 2 * size_bytes * iters_kernel (read + write, iters razy).
     """
-    return {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "host_system": platform.system(),
-        "host_node": platform.node(),
-        "host_release": platform.release(),
-        "host_version": platform.version(),
-        "host_machine": platform.machine(),
-        "host_arch": platform.machine(),
-        "python_version": platform.python_version(),
-        "gpu_backend": gpu_backend,
-        "gpu_device_id": device_id,
-        "gpu_name": gpu_name,
-    }
+    lib, lib_path = gpu_utils.load_cuda_library()
+    gpu_utils.configure_cuda_functions(lib)
 
+    dev_id, dev_name = gpu_utils.select_cuda_device(lib, preferred_index=preferred_device)
 
-def bench_gpu_mem_copy(lib, device_id: int, bytes_per_iter: int, iters: int):
-    elapsed_s = lib.gpu_mem_copy_elapsed(bytes_per_iter, iters, device_id)
-    total_bytes = float(bytes_per_iter) * float(iters)
-    if elapsed_s > 0.0:
-        gbps = (total_bytes / elapsed_s) / (1024.0**3)
-    else:
-        gbps = 0.0
+    print("=== GPU memory bandwidth benchmark (CUDA, mem_copy_kernel) ===")
+    print(f"CUDA library : {lib_path}")
+    print(f"GPU device   : {dev_name} (id {dev_id})")
+    print(f"runs per size: {runs_per_size}")
+    print(f"iters_kernel : {iters_kernel}")
+    print()
 
-    return {
-        "size_bytes": bytes_per_iter,
-        "iters": iters,
-        "elapsed_s": elapsed_s,
-        "gbps": gbps,
-    }
-
-
-def write_result_to_csv(
-    csv_path: Path,
-    result: dict,
-    meta: dict,
-    benchmark_name: str,
-    run_id: int,
-    write_header: bool,
-):
-    row = {
-        **meta,
-        "benchmark": benchmark_name,
-        "run_id": run_id,
-        **result,
-    }
+    csv_path = gpu_utils.make_gpu_csv_path(
+        ROOT, "gpu_bandwidth", "cuda", dev_name
+    )
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    header_written = csv_path.exists() and csv_path.stat().st_size > 0
 
     fieldnames = [
         "timestamp",
-        "host_system",
-        "host_node",
-        "host_release",
-        "host_version",
-        "host_machine",
-        "host_arch",
+        "backend",
+        "system",
+        "arch",
+        "hostname",
         "python_version",
-        "gpu_backend",
-        "gpu_device_id",
-        "gpu_name",
-        "benchmark",
-        "run_id",
+        "gpu_model",
+        "gpu_index",
         "size_bytes",
-        "iters",
+        "num_elements",
+        "run_idx",
         "elapsed_s",
-        "gbps",
+        "throughput_gbps",
+        "energy_joule",
+        "avg_power_watt",
     ]
 
-    with csv_path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    for size_mb in sizes_mb:
+        size_bytes = size_mb * 1024 * 1024
+        num_elements = size_bytes // 4  # float32
+        print(f"--- Size: {size_mb:5d} MB ({size_bytes} bytes, {num_elements} elements) ---")
+
+        times: list[float] = []
+
+        for run_idx in range(runs_per_size):
+            elapsed = lib.gpu_mem_copy_elapsed(
+                size_bytes,
+                dev_id,
+                iters_kernel,
+            )
+            if elapsed <= 0.0:
+                print(
+                    f"[ERROR] gpu_mem_copy_elapsed zwrócił {elapsed} s "
+                    f"(run {run_idx}, size {size_mb} MB)"
+                )
+                continue
+
+            # 2 * size_bytes * iters_kernel (read+write, powtórzone iters_kernel razy)
+            total_bytes = 2.0 * float(size_bytes) * float(iters_kernel)
+            gbps = total_bytes / elapsed / 1e9
+
+            times.append(elapsed)
+
+            print(
+                f"run {run_idx:2d}: elapsed = {elapsed:8.4f} s, "
+                f"GB/s = {gbps:7.2f}"
+            )
+
+            # Na razie energii nie mierzymy dla CUDA – zostawiamy puste pola.
+            row = gpu_utils.common_gpu_metadata("cuda", dev_name, dev_id)
+            row.update(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "size_bytes": str(size_bytes),
+                    "num_elements": str(num_elements),
+                    "run_idx": str(run_idx),
+                    "elapsed_s": f"{elapsed:.6f}",
+                    "throughput_gbps": f"{gbps:.4f}",
+                    "energy_joule": "",
+                    "avg_power_watt": "",
+                }
+            )
+
+            with csv_path.open("a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not header_written:
+                    writer.writeheader()
+                    header_written = True
+                writer.writerow(row)
+
+        if times:
+            mean_gbps = stats.mean(
+                (2.0 * float(size_bytes) * float(iters_kernel) / t) / 1e9 for t in times
+            )
+            std_gbps = stats.pstdev(
+                (2.0 * float(size_bytes) * float(iters_kernel) / t) / 1e9 for t in times
+            ) if len(times) > 1 else 0.0
+
+            print(
+                f"==> MEAN: {mean_gbps:7.2f} GB/s, "
+                f"sigma = {std_gbps:7.2f} GB/s"
+            )
+        print()
+
+    print(f"Wszystkie runy (CUDA bandwidth) zapisane do: {csv_path}")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="GPU memory bandwidth benchmark (CUDA)."
     )
@@ -104,94 +140,35 @@ def main():
         "--device",
         type=int,
         default=None,
-        help="Indeks urządzenia CUDA (domyślnie z GPU_DEVICE_ID lub 0).",
+        help="ID urządzenia CUDA (jeśli nie podano – wybór automatyczny).",
     )
     parser.add_argument(
         "--runs",
         type=int,
-        default=5,
-        help="Liczba powtórzeń na konfigurację.",
+        default=7,
+        help="Liczba powtórzeń dla każdego rozmiaru.",
     )
     parser.add_argument(
         "--iters",
         type=int,
         default=20,
-        help="Liczba iteracji w kernelu GPU.",
+        help="Liczba iteracji w kernelu (inner loop).",
+    )
+    parser.add_argument(
+        "--sizes-mb",
+        type=int,
+        nargs="*",
+        default=[4, 16, 64, 256, 1024],
+        help="Lista rozmiarów bufora w MB (domyślnie: 4 16 64 256 1024).",
     )
 
     args = parser.parse_args()
-
-    try:
-        lib, lib_path = load_cuda_library()
-    except FileNotFoundError as e:
-        print(f"[ERROR] {e}")
-        print("Zbuduj najpierw GPU lib: gpu/lib/build_cuda.sh")
-        sys.exit(1)
-
-    configure_cuda_functions(lib)
-
-    device_id, gpu_name = select_cuda_device(lib, preferred_index=args.device)
-    gpu_backend = "cuda"
-
-    root = ROOT
-    data_dir = root / "data" / "gpu"
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    csv_path = make_gpu_specific_csv_path(
-        "gpu_bandwidth",
-        data_dir,
-        gpu_backend=gpu_backend,
-        gpu_name=gpu_name,
-        device_id=device_id,
+    run_gpu_bandwidth(
+        preferred_device=args.device,
+        runs_per_size=args.runs,
+        sizes_mb=args.sizes_mb,
+        iters_kernel=args.iters,
     )
-    if csv_path.exists():
-        csv_path.unlink()
-
-    meta = collect_metadata(gpu_backend, gpu_name, device_id)
-
-    sizes_mb = [64, 256, 1024]  # 64 MB..1 GB
-    runs = args.runs
-    iters = args.iters
-
-    print("=== GPU memory bandwidth benchmark (CUDA) ===")
-    print(f"GPU backend      : {gpu_backend}")
-    print(f"GPU device       : {device_id} -> {gpu_name}")
-    print(f"runs per size    : {runs}")
-    print(f"iters in kernel  : {iters}")
-    print(f"CSV output       : {csv_path}")
-
-    header_written = False
-
-    for size_mb in sizes_mb:
-        bytes_per_iter = size_mb * 1024 * 1024
-        gbps_values = []
-
-        print(f"\n--- Size: {size_mb} MB ---")
-
-        for run_id in range(runs):
-            result = bench_gpu_mem_copy(lib, device_id, bytes_per_iter, iters)
-            gbps_values.append(result["gbps"])
-
-            write_result_to_csv(
-                csv_path,
-                result,
-                meta,
-                benchmark_name="gpu_mem_copy",
-                run_id=run_id,
-                write_header=not header_written,
-            )
-            header_written = True
-
-            print(
-                f"run {run_id:2d}: elapsed = {result['elapsed_s']:.6f} s, "
-                f"GB/s = {result['gbps']:.2f}"
-            )
-
-        mean_gbps = stats.mean(gbps_values)
-        stdev_gbps = stats.pstdev(gbps_values) if len(gbps_values) > 1 else 0.0
-        print(f"==> ŚREDNIA: {mean_gbps:.2f} GB/s, σ = {stdev_gbps:.2f} GB/s")
-
-    print(f"\nWszystkie runy zapisane do: {csv_path}")
 
 
 if __name__ == "__main__":

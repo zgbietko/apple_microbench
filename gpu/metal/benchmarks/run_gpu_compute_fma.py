@@ -1,201 +1,175 @@
-# gpu/benchmarks/run_gpu_compute_fma.py
+from __future__ import annotations
+
 import argparse
 import csv
-import platform
-from datetime import datetime
-from pathlib import Path
 import statistics as stats
+from datetime import datetime, timezone
+from pathlib import Path
 import sys
 
+# ROOT projektu: .../apple_microbench
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gpu.gpu_utils import (
-    load_cuda_library,
-    configure_cuda_functions,
-    select_cuda_device,
-    make_gpu_specific_csv_path,
-)
+import gpu_utils  # z apple_microbench/gpu_utils.py
 
 
-def collect_metadata(gpu_backend: str, gpu_name: str, device_id: int):
-    return {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "host_system": platform.system(),
-        "host_node": platform.node(),
-        "host_release": platform.release(),
-        "host_version": platform.version(),
-        "host_machine": platform.machine(),
-        "host_arch": platform.machine(),
-        "python_version": platform.python_version(),
-        "gpu_backend": gpu_backend,
-        "gpu_device_id": device_id,
-        "gpu_name": gpu_name,
-    }
+def run_gpu_fma(
+    preferred_device: int | None,
+    vector_len: int,
+    runs_per_config: int,
+    inner_iters_list: list[int],
+) -> None:
+    """
+    Benchmark FMA na CUDA (GFLOP/s), analogiczny do GPU Metal i CPU.
+    gpu_fma_elapsed(n, dev, iters) mierzy czas dla:
+      - n elementów float32,
+      - iters iteracji w kernelu.
+    FLOP = 2 * n * iters.
+    """
+    lib, lib_path = gpu_utils.load_cuda_library()
+    gpu_utils.configure_cuda_functions(lib)
 
+    dev_id, dev_name = gpu_utils.select_cuda_device(lib, preferred_index=preferred_device)
 
-def bench_gpu_fma(lib, device_id: int, n: int, iters: int):
-    elapsed_s = lib.gpu_fma_elapsed(n, iters, device_id)
-    total_ops = 2.0 * float(n) * float(iters)  # 1 mul + 1 add na iterację
-    if elapsed_s > 0.0:
-        gflops = (total_ops / elapsed_s) / 1e9
-    else:
-        gflops = 0.0
+    print("=== GPU FMA compute benchmark (CUDA) ===")
+    print(f"CUDA library    : {lib_path}")
+    print(f"GPU device      : {dev_name} (id {dev_id})")
+    print(f"vector_len      : {vector_len}")
+    print(f"runs per config : {runs_per_config}")
+    print(f"inner_iters     : {inner_iters_list}")
+    print()
 
-    return {
-        "n": n,
-        "iters_inner": iters,
-        "elapsed_s": elapsed_s,
-        "gflops": gflops,
-    }
-
-
-def write_result_to_csv(
-    csv_path: Path,
-    result: dict,
-    meta: dict,
-    benchmark_name: str,
-    run_id: int,
-    write_header: bool,
-):
-    row = {
-        **meta,
-        "benchmark": benchmark_name,
-        "run_id": run_id,
-        **result,
-    }
+    csv_path = gpu_utils.make_gpu_csv_path(
+        ROOT, "gpu_compute_fma", "cuda", dev_name
+    )
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    header_written = csv_path.exists() and csv_path.stat().st_size > 0
 
     fieldnames = [
         "timestamp",
-        "host_system",
-        "host_node",
-        "host_release",
-        "host_version",
-        "host_machine",
-        "host_arch",
+        "backend",
+        "system",
+        "arch",
+        "hostname",
         "python_version",
-        "gpu_backend",
-        "gpu_device_id",
-        "gpu_name",
-        "benchmark",
-        "run_id",
-        "n",
-        "iters_inner",
+        "gpu_model",
+        "gpu_index",
+        "vector_len",
+        "inner_iters",
+        "run_idx",
         "elapsed_s",
-        "gflops",
+        "throughput_gflops",
+        "energy_joule",
+        "avg_power_watt",
     ]
 
-    with csv_path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    for inner_iters in inner_iters_list:
+        print(f"--- inner_iters = {inner_iters} ---")
+
+        times: list[float] = []
+
+        for run_idx in range(runs_per_config):
+            elapsed = lib.gpu_fma_elapsed(
+                vector_len,
+                dev_id,
+                inner_iters,
+            )
+            if elapsed <= 0.0:
+                print(
+                    f"[ERROR] gpu_fma_elapsed zwrócił {elapsed} s "
+                    f"(run {run_idx}, inner_iters {inner_iters})"
+                )
+                continue
+
+            flops = 2.0 * float(vector_len) * float(inner_iters)
+            gflops = flops / elapsed / 1e9
+
+            times.append(elapsed)
+
+            print(
+                f"run {run_idx:2d}: elapsed = {elapsed:8.4f} s, "
+                f"GFLOP/s = {gflops:7.2f}"
+            )
+
+            row = gpu_utils.common_gpu_metadata("cuda", dev_name, dev_id)
+            row.update(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "vector_len": str(vector_len),
+                    "inner_iters": str(inner_iters),
+                    "run_idx": str(run_idx),
+                    "elapsed_s": f"{elapsed:.6f}",
+                    "throughput_gflops": f"{gflops:.4f}",
+                    "energy_joule": "",
+                    "avg_power_watt": "",
+                }
+            )
+
+            with csv_path.open("a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not header_written:
+                    writer.writeheader()
+                    header_written = True
+                writer.writerow(row)
+
+        if times:
+            mean_gflops = stats.mean(
+                (2.0 * float(vector_len) * float(inner_iters) / t) / 1e9
+                for t in times
+            )
+            std_gflops = stats.pstdev(
+                (2.0 * float(vector_len) * float(inner_iters) / t) / 1e9
+                for t in times
+            ) if len(times) > 1 else 0.0
+
+            print(
+                f"==> MEAN: {mean_gflops:7.2f} GFLOP/s, "
+                f"sigma = {std_gflops:7.2f} GFLOP/s"
+            )
+        print()
+
+    print(f"Wszystkie runy (CUDA FMA) zapisane do: {csv_path}")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="GPU FMA compute throughput benchmark (CUDA)."
+        description="GPU FMA compute benchmark (CUDA)."
     )
     parser.add_argument(
         "--device",
         type=int,
         default=None,
-        help="Indeks urządzenia CUDA (domyślnie z GPU_DEVICE_ID lub 0).",
+        help="ID urządzenia CUDA (jeśli nie podano – wybór automatyczny).",
+    )
+    parser.add_argument(
+        "--vector-len",
+        type=int,
+        default=1 << 20,  # 1M elementów
+        help="Długość wektora (liczba elementów float32).",
     )
     parser.add_argument(
         "--runs",
         type=int,
         default=5,
-        help="Liczba powtórzeń na konfigurację.",
+        help="Liczba powtórzeń dla każdej konfiguracji.",
     )
     parser.add_argument(
-        "--n",
+        "--inner-iters",
         type=int,
-        default=1_000_000,
-        help="Długość wektora (liczba elementów float).",
-    )
-    parser.add_argument(
-        "--iters",
-        type=int,
-        nargs="+",
-        default=[250_000, 500_000, 1_000_000],
-        help="Lista wartości iters_inner dla kernela FMA.",
+        nargs="*",
+        default=[1000, 5000, 10000],
+        help="Lista wartości inner_iters (domyślnie: 1000 5000 10000).",
     )
 
     args = parser.parse_args()
-
-    try:
-        lib, lib_path = load_cuda_library()
-    except FileNotFoundError as e:
-        print(f"[ERROR] {e}")
-        print("Zbuduj najpierw GPU lib: gpu/lib/build_cuda.sh")
-        sys.exit(1)
-
-    configure_cuda_functions(lib)
-
-    device_id, gpu_name = select_cuda_device(lib, preferred_index=args.device)
-    gpu_backend = "cuda"
-
-    root = ROOT
-    data_dir = root / "data" / "gpu"
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    csv_path = make_gpu_specific_csv_path(
-        "gpu_compute_fma",
-        data_dir,
-        gpu_backend=gpu_backend,
-        gpu_name=gpu_name,
-        device_id=device_id,
+    run_gpu_fma(
+        preferred_device=args.device,
+        vector_len=args.vector_len,
+        runs_per_config=args.runs,
+        inner_iters_list=args.inner_iters,
     )
-    if csv_path.exists():
-        csv_path.unlink()
-
-    meta = collect_metadata(gpu_backend, gpu_name, device_id)
-
-    runs = args.runs
-    n = args.n
-    iters_list = args.iters
-
-    print("=== GPU FMA compute throughput benchmark (CUDA) ===")
-    print(f"GPU backend      : {gpu_backend}")
-    print(f"GPU device       : {device_id} -> {gpu_name}")
-    print(f"vector length    : n = {n}")
-    print(f"runs per iters   : {runs}")
-    print(f"iters list       : {iters_list}")
-    print(f"CSV output       : {csv_path}")
-
-    header_written = False
-
-    for iters_inner in iters_list:
-        gflops_values = []
-
-        print(f"\n--- iters_inner = {iters_inner} ---")
-
-        for run_id in range(runs):
-            result = bench_gpu_fma(lib, device_id, n, iters_inner)
-            gflops_values.append(result["gflops"])
-
-            write_result_to_csv(
-                csv_path,
-                result,
-                meta,
-                benchmark_name="gpu_fma",
-                run_id=run_id,
-                write_header=not header_written,
-            )
-            header_written = True
-
-            print(
-                f"run {run_id:2d}: elapsed = {result['elapsed_s']:.6f} s, "
-                f"GFlop/s = {result['gflops']:.2f}"
-            )
-
-        mean_gflops = stats.mean(gflops_values)
-        stdev_gflops = stats.pstdev(gflops_values) if len(gflops_values) > 1 else 0.0
-        print(f"==> ŚREDNIA: {mean_gflops:.2f} GF/s, σ = {stdev_gflops:.2f} GF/s")
-
-    print(f"\nWszystkie runy zapisane do: {csv_path}")
 
 
 if __name__ == "__main__":
