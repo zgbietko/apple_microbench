@@ -94,11 +94,11 @@ def run_cuda_benchmarks() -> None:
 
     ok = True
     ok &= run_script(
-        "gpu/benchmarks/run_gpu_bandwidth.py",
+        "gpu/cuda/benchmarks/run_cuda_bandwidth.py",
         ["--device", str(dev_id)],
     )
     ok &= run_script(
-        "gpu/benchmarks/run_gpu_compute_fma.py",
+        "gpu/cuda/benchmarks/run_cuda_compute_fma.py",
         ["--device", str(dev_id)],
     )
 

@@ -209,6 +209,6 @@ def _demo() -> None:
             f"{info.global_mem_gb:.1f} GiB"
         )
 
-
+CudaBackend = CudaContext
 if __name__ == "__main__":
     _demo()
